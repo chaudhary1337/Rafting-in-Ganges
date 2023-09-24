@@ -50,9 +50,14 @@ func (rf *Raft) debug(args ...any) {
 
 const (
 	// states
-	FOLLOWER  = "FOLLOWER"
-	CANDIDATE = "CANDIDATE"
-	LEADER    = "LEADER"
+	Follower  = "FOLLOWER"
+	Candidate = "CANDIDATE"
+	Leader    = "LEADER"
+
+	// timers
+	Tick      = 20 * time.Millisecond
+	Heartbeat = 50 * time.Millisecond
+	Election  = 150 * time.Millisecond
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -102,7 +107,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	rf.mu.Lock()
 	term = rf.currentTerm
-	isleader = (rf.state == LEADER)
+	isleader = (rf.state == Leader)
 	defer rf.mu.Unlock()
 
 	rf.debug()
@@ -278,7 +283,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
-	rf.state = FOLLOWER
+	rf.state = Follower
 
 	rf.debug()
 
