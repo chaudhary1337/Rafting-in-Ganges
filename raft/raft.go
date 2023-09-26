@@ -40,6 +40,8 @@ func (rf *Raft) debug(args ...any) {
 	callerPath := strings.Split(details.Name(), ".")
 	callerName := callerPath[len(callerPath)-1]
 
+	return
+
 	fmt.Printf("[S%d:%s:%d]\t[%s]\t", rf.me, rf.state, rf.currentTerm, callerName)
 
 	for _, arg := range args {
@@ -55,9 +57,9 @@ const (
 	Leader    = "LEADER"
 
 	// timers
-	Tick      = 50 * time.Millisecond
-	Heartbeat = 75 * time.Millisecond
-	Election  = 250 * time.Millisecond
+	Tick      = 20 * time.Millisecond
+	Heartbeat = 70 * time.Millisecond
+	Election  = 300 * time.Millisecond
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -99,7 +101,8 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	state string // one of FOLLOWER, CANDIDATE, LEADER
+	state         string           // one of FOLLOWER, CANDIDATE, LEADER
+	internalTimer <-chan time.Time // internal timer. either electionTimer duration or heartbeat duration
 
 	// persistent state
 	currentTerm int        // latest term server has seen (initialized to 0 on first boot, increases monotonically)
@@ -181,13 +184,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+// Assumes the server is locked.
+// Defaults the server state to a Follower state with
+// currentTerm, internalTimer, votedFor reseted.
+func (rf *Raft) toFollower(term int) {
+	rf.currentTerm = term
+	rf.state = Follower
+	rf.votedFor = -1
+}
+
 type AppendEntriesArgs struct {
 	Term         int   // leader's term
 	LeaderId     int   // so follower can redirect clients
 	PrevLogIndex int   // index of log entry immediately preceding new ones
 	PrevLogTerm  int   // term of prevLogIndex entry
-	entries      []int // log entries to store (empty for heartbeat; may send more than one for efficiency)
-	leaderCommit int   // leader's commitIndex
+	Entries      []int // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int   // leader's commitIndex
 }
 
 type AppendEntriesReply struct {
@@ -200,9 +212,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	// Reply false if term < currentTerm
-	if reply.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		return
 	}
 
 	// Reply false if log doesn't contain an entry at prevLogIndex
@@ -221,21 +234,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// If leaderCommit > commitIndex,
 	// set commitIndex = min(leaderCommit, index of last new entry)
 
-	// finally
+	// AppendEntry resets the state to Follower,
+	// and thus also the internalTimer to the default Election + random time
+	// We always update the currentTerm
+	// After server updates, we set the appropirate reply.
+
+	rf.toFollower(args.Term)
+	rf.debug("Received AE RPC. Converted to follower.")
+
 	reply.Term = rf.currentTerm
 	reply.Success = true
+	return
 }
 
-func (rf *Raft) sendAppendEntries(appendEntryCh chan AppendEntriesReply) {
+func (rf *Raft) sendAppendEntries() {
 	rf.debug()
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: 1,
 		PrevLogTerm:  -1,
-		// entries:      nil,
-		leaderCommit: -1,
+		// Entries:      nil,
+		LeaderCommit: -1,
 	}
 
 	for server := range rf.peers {
@@ -246,10 +269,10 @@ func (rf *Raft) sendAppendEntries(appendEntryCh chan AppendEntriesReply) {
 		go func(server int) {
 			reply := AppendEntriesReply{}
 			rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
-
-			appendEntryCh <- reply
+			if reply.Term > rf.currentTerm {
+				rf.toFollower(reply.Term)
+			}
 		}(server)
-
 	}
 }
 
@@ -283,6 +306,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	// if you reach here, the term is up to date
+	// if its more, then catch up by becoming a Follower
+	if args.Term > rf.currentTerm {
+		rf.toFollower(args.Term)
+	}
+
 	// If votedFor is null or candidateId,
 	// and candidate's log is at least as up-to-date as receiver's log
 	// grant vote
@@ -303,6 +332,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) collectVotes(voteCh chan RequestVoteReply) {
 	rf.debug()
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.currentTerm++
 
 	args := RequestVoteArgs{
@@ -401,11 +433,11 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) followerLoop() {
-	electionTimer := time.After(Election + time.Duration(rand.Int63())%Election)
+	rf.internalTimer = time.After(Election + time.Duration(rand.Int63())%Election)
 
 	for rf.state == Follower {
 		select {
-		case <-electionTimer:
+		case <-rf.internalTimer:
 			rf.debug("Election timer went off. Starting elections.")
 			rf.state = Candidate
 		default:
@@ -413,15 +445,12 @@ func (rf *Raft) followerLoop() {
 			time.Sleep(Tick)
 		}
 	}
-
-	// reaches here if no longer a follower.
-	// electionTimer went off, and now is a candidate
 }
 
 func (rf *Raft) candidateLoop() {
 	// case 1: spawn a ticker that resets this candidate's existence
 	// if enough time passes without substantial results from elections
-	electionTimer := time.After(Election + time.Duration(rand.Int63())%Election)
+	rf.internalTimer = time.After(Election + time.Duration(rand.Int63())%Election)
 
 	// case 2: spawn a goroutine that collects votes,
 	// and notifies the result on a channel
@@ -430,8 +459,7 @@ func (rf *Raft) candidateLoop() {
 	// BUT, we can't quit (using another channel) since if any other server
 	// returns some reply late, golang will panic
 	voteCh := make(chan RequestVoteReply)
-	go rf.collectVotes(voteCh)
-	// total := 1
+	rf.collectVotes(voteCh)
 	votes := 1
 
 	// case 3: default
@@ -439,33 +467,18 @@ func (rf *Raft) candidateLoop() {
 
 	for rf.state == Candidate {
 		select {
-		case <-electionTimer:
+		case <-rf.internalTimer:
 			rf.debug("Election timer went off. Redoing elections.")
-			// CAN I JUST RETURN HERE, AND EXPECT THE MAIN `loop` to call it back anyways!???
-			// this would be super smart and cool if this works hehe
 			return
-
-			// rf.debug("nothing happened, redoing election")
-			// electionTimer = time.After(Election + time.Duration(rand.Int63())%Election)
-
-			// // spawn a goroutine that collects votes, and notifies the result on a channel
-			// voteCh = make(chan RequestVoteReply)
-			// go rf.collectVotes(voteCh)
-
 		case reply := <-voteCh:
-			rf.debug(reply.VoteGranted, reply.Term)
-
-			// if any reply term is greater, candidate is behind
-			if reply.Term > rf.currentTerm {
-				rf.debug("Detected higher term server, converting to follower.")
-				rf.state = Follower
-			}
+			rf.debug("Got vote reply form someone.", reply.VoteGranted, reply.Term)
 
 			// if vote granted
 			if reply.VoteGranted {
 				votes++
 			}
 
+			// if majority, convert to leader
 			if votes >= len(rf.peers)/2 {
 				rf.state = Leader
 			}
@@ -480,15 +493,16 @@ func (rf *Raft) candidateLoop() {
 }
 
 func (rf *Raft) leaderLoop() {
-	heartbeatTimer := time.After(Heartbeat)
-	appendEntryCh := make(chan AppendEntriesReply)
+	rf.debug("First heartbeat to declare authority.")
+	rf.sendAppendEntries()
+
+	rf.internalTimer = time.After(Heartbeat)
 
 	for rf.state == Leader {
 		select {
-		case <-heartbeatTimer:
-			rf.debug("will send heartbeat")
-			go rf.sendAppendEntries(appendEntryCh)
-
+		case <-rf.internalTimer:
+			rf.debug("Will send heartbeat.")
+			rf.sendAppendEntries()
 		default:
 			rf.debug("Sleeping")
 			time.Sleep(Tick)
@@ -536,10 +550,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
-	rf.currentTerm = 0
-	rf.state = Follower
-	rf.votedFor = -1
+	rf.toFollower(0)
 
 	// temporary log init to nil as first value
 	rf.log = append(rf.log, LogEntry{
