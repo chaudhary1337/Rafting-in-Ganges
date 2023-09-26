@@ -57,9 +57,9 @@ const (
 	Leader    = "LEADER"
 
 	// timers
-	Tick      = 20 * time.Millisecond
-	Heartbeat = 70 * time.Millisecond
-	Election  = 300 * time.Millisecond
+	Tick      = 10 * time.Millisecond
+	Heartbeat = 100 * time.Millisecond
+	Election  = 750 * time.Millisecond
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -131,8 +131,6 @@ func (rf *Raft) GetState() (int, bool) {
 
 	term = rf.currentTerm
 	isleader = (rf.state == Leader)
-
-	rf.debug()
 
 	return term, isleader
 }
@@ -248,10 +246,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries() {
-	rf.debug()
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -295,7 +289,6 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -331,10 +324,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) collectVotes(voteCh chan RequestVoteReply) {
-	rf.debug()
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.currentTerm++
 
 	args := RequestVoteArgs{
@@ -352,7 +341,6 @@ func (rf *Raft) collectVotes(voteCh chan RequestVoteReply) {
 		go func(server int) {
 			reply := RequestVoteReply{}
 			rf.peers[server].Call("Raft.RequestVote", &args, &reply)
-
 			voteCh <- reply
 		}(server)
 	}
@@ -462,9 +450,6 @@ func (rf *Raft) candidateLoop() {
 	rf.collectVotes(voteCh)
 	votes := 1
 
-	// case 3: default
-	// to prevent busy waiting, we check what happened after every `Tick`
-
 	for rf.state == Candidate {
 		select {
 		case <-rf.internalTimer:
@@ -479,7 +464,7 @@ func (rf *Raft) candidateLoop() {
 			}
 
 			// if majority, convert to leader
-			if votes >= len(rf.peers)/2 {
+			if votes > len(rf.peers)/2 {
 				rf.state = Leader
 			}
 
@@ -501,7 +486,7 @@ func (rf *Raft) leaderLoop() {
 	for rf.state == Leader {
 		select {
 		case <-rf.internalTimer:
-			rf.debug("Will send heartbeat.")
+			rf.debug("Will send AEs now.")
 			rf.sendAppendEntries()
 		default:
 			rf.debug("Sleeping")
@@ -523,13 +508,6 @@ func (rf *Raft) loop() {
 		case Leader:
 			rf.leaderLoop()
 		}
-
-		// I don't think its necessary,
-		// but I can have some pause when state transision happens.
-		// // pause for a random amount of time between 50 and 350
-		// // milliseconds.
-		// ms := 50 + (rand.Int63() % 300)
-		// time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
