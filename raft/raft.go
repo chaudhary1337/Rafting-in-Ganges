@@ -20,16 +20,23 @@ package raft
 import (
 	"Rafting-in-Ganges/labrpc"
 	"fmt"
+	"math/rand"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
+	// states
 	Leader    = "Leader"
 	Candidate = "Candidate"
 	Follower  = "Follower"
+	// times
+	HeartBeat    = 100
+	ElectionBase = 350
+	ElectionVar  = 250
 )
 
 func (rf *Raft) debug(args ...interface{}) {
@@ -37,19 +44,12 @@ func (rf *Raft) debug(args ...interface{}) {
 	fullName := strings.Split(runtime.FuncForPC(counter).Name(), ".")
 	name := fullName[len(fullName)-1]
 
-	indent := strings.Repeat("\t", 4*rf.me)
-	fmt.Printf("%s[S%d:%s:%d]\t[%s]", indent, rf.me, rf.state, rf.currentTerm, name)
+	indent := strings.Repeat("\t", 7*rf.me)
+	fmt.Printf("%s[S%d:%s:%d]{%s}", indent, rf.me, rf.state, rf.currentTerm, name)
 	for _, arg := range args {
-		fmt.Printf("%s", arg)
+		fmt.Printf(" (%s)", arg)
 	}
 	fmt.Println()
-}
-
-func (rf *Raft) toFollower() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.state = Follower
 }
 
 // as each Raft peer becomes aware that successive log entries are
@@ -88,7 +88,6 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.debug()
 
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
@@ -219,6 +218,61 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func getElectionTimeout() time.Duration {
+	totalTime := ElectionBase + rand.Intn(ElectionVar)
+	return time.Duration(totalTime) * time.Millisecond
+}
+
+// assumes no lock
+// changes the state to the toState in a thread-safe way
+func (rf *Raft) atomicStateChange(toState string) {
+	rf.mu.Lock()
+	rf.state = toState
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) toFollower() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.state = Follower
+}
+
+func (rf *Raft) toCandidate() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.state = Candidate
+	rf.currentTerm++
+
+	// broadcast RV RPC
+}
+
+func (rf *Raft) loop() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
+
+		switch state {
+		case Follower:
+			select {
+			case <-time.After(getElectionTimeout()):
+				rf.debug("Follower timeout")
+				// checkout uber-go for this
+				rf.atomicStateChange(Candidate)
+			}
+		case Candidate:
+			select {
+			case <-time.After(getElectionTimeout()):
+				rf.debug("Candidate timeout")
+			}
+		case Leader:
+			rf.debug(Leader)
+		}
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -242,6 +296,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.debug()
+	go rf.loop()
 
 	return rf
 }
