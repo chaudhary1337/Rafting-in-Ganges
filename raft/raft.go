@@ -19,12 +19,38 @@ package raft
 
 import (
 	"Rafting-in-Ganges/labrpc"
+	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
 
-// import "bytes"
-// import "labgob"
+const (
+	Leader    = "Leader"
+	Candidate = "Candidate"
+	Follower  = "Follower"
+)
+
+func (rf *Raft) debug(args ...interface{}) {
+	counter, _, _, _ := runtime.Caller(1)
+	fullName := strings.Split(runtime.FuncForPC(counter).Name(), ".")
+	name := fullName[len(fullName)-1]
+
+	indent := strings.Repeat("\t", 4*rf.me)
+	fmt.Printf("%s[S%d:%s:%d]\t[%s]", indent, rf.me, rf.state, rf.currentTerm, name)
+	for _, arg := range args {
+		fmt.Printf("%s", arg)
+	}
+	fmt.Println()
+}
+
+func (rf *Raft) toFollower() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.state = Follower
+}
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -52,17 +78,22 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	currentTerm int
+	state       string
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.debug()
+
+	term := rf.currentTerm
+	isLeader := rf.state == Leader
+
+	return term, isLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -205,9 +236,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.toFollower()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.debug()
 
 	return rf
 }
