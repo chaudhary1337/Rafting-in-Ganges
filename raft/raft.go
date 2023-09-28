@@ -248,59 +248,11 @@ func (rf *Raft) toFollower(term int) {
 	rf.votedFor = -1
 }
 
-// non-blocking unbuffered notification to a channel
-func (rf *Raft) notify(ch chan bool) {
-	select {
-	case ch <- true:
-	default:
-	}
-}
-
-// assumes lock
-// sends the same set of args to all other servers to
-func (rf *Raft) broadcastRequestVotes() {
-	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
-	}
-
-	for server := range rf.peers {
-		if server != rf.me {
-			go rf.sendRequestVote(server, &args, &RequestVoteReply{})
-		}
-	}
-}
-
-// assumes no lock
-func (rf *Raft) startElections() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.debug()
-
-	rf.currentTerm++
-	rf.votedFor = rf.me
-	votes := 1
-
-	if votes == len(rf.peers)/2+1 {
-		go func() {
-			rf.notify(rf.electionWinCh)
-		}()
-	}
-
-}
-
-// assumes no lock. changes the state to the toState in a thread-safe way
-// checkout uber-go for this, later.
-func (rf *Raft) atomicStateChange(toState string) {
-	rf.mu.Lock()
-	rf.state = toState
-	rf.mu.Unlock()
-}
-
 func (rf *Raft) loop() {
 	for !rf.killed() {
 		rf.mu.Lock()
 		state := rf.state
+		rf.debug()
 		rf.mu.Unlock()
 
 		switch state {
@@ -308,22 +260,16 @@ func (rf *Raft) loop() {
 			select {
 			case <-time.After(getElectionTimeout()):
 				rf.debug("Follower timeout")
-				rf.atomicStateChange(Candidate)
-				rf.startElections()
 			}
 		case Candidate:
 			select {
-			case <-rf.electionWinCh:
-				rf.debug("Won elections")
-				rf.atomicStateChange(Leader)
 			case <-time.After(getElectionTimeout()):
 				rf.debug("Candidate timeout")
-				rf.startElections()
 			}
 		case Leader:
 			select {
 			case <-time.After(getHeartbeat()):
-				rf.debug("Sending heartbeat")
+				rf.debug("Heartbeat timeout")
 			}
 		}
 	}
