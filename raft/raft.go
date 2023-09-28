@@ -34,9 +34,9 @@ const (
 	Candidate = "Candidate"
 	Follower  = "Follower"
 	// times
-	HeartBeat    = 100
-	ElectionBase = 350
-	ElectionVar  = 250
+	HeartBeat    = 100 // the minimum possible amount for the tester
+	ElectionBase = 350 // 3x of heartbeat
+	ElectionVar  = 350 // introduces inconsistency in election timers
 )
 
 func (rf *Raft) debug(args ...interface{}) {
@@ -78,8 +78,11 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm int
-	state       string
+	state string // Follower or Candidate or Leader
+
+	// persistent state
+	currentTerm int // currentTerm latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    int // candidateId that received vote in current term (or null if none)
 }
 
 // return currentTerm and whether this server
@@ -133,12 +136,16 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int // candidate's term
+	CandidateId int // candidate who is requesting vote
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int  // currentTerm for the candidate to update itself
+	VoteGranted bool // true means the candidate received a vote
 }
 
 // example RequestVote RPC handler.
@@ -173,10 +180,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
+// func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+// 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+// 	return ok
+// }
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -200,6 +207,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+// gets a time.Duration as return that can be used in time.After
+// uses ElectionBase and ElectionVar
+func getElectionTimeout() time.Duration {
+	totalTime := ElectionBase + rand.Intn(ElectionVar)
+	return time.Duration(totalTime) * time.Millisecond
+}
+
+// gets a time.Duration as return that can be used in time.After
+// uses Heartbeat
+func getHeartbeat() time.Duration {
+	return time.Duration(HeartBeat) * time.Millisecond
+}
+
 // the tester calls Kill() when a Raft instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -218,34 +238,21 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func getElectionTimeout() time.Duration {
-	totalTime := ElectionBase + rand.Intn(ElectionVar)
-	return time.Duration(totalTime) * time.Millisecond
-}
-
-// assumes no lock
-// changes the state to the toState in a thread-safe way
-func (rf *Raft) atomicStateChange(toState string) {
-	rf.mu.Lock()
-	rf.state = toState
-	rf.mu.Unlock()
-}
-
-func (rf *Raft) toFollower() {
+func (rf *Raft) toFollower(term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	rf.state = Follower
+	rf.currentTerm = term
+	rf.votedFor = -1
 }
 
-func (rf *Raft) toCandidate() {
+// assumes no lock. changes the state to the toState in a thread-safe way
+// checkout uber-go for this, later.
+func (rf *Raft) atomicStateChange(toState string) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.state = Candidate
-	rf.currentTerm++
-
-	// broadcast RV RPC
+	rf.state = toState
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) loop() {
@@ -259,8 +266,6 @@ func (rf *Raft) loop() {
 			select {
 			case <-time.After(getElectionTimeout()):
 				rf.debug("Follower timeout")
-				// checkout uber-go for this
-				rf.atomicStateChange(Candidate)
 			}
 		case Candidate:
 			select {
@@ -268,7 +273,10 @@ func (rf *Raft) loop() {
 				rf.debug("Candidate timeout")
 			}
 		case Leader:
-			rf.debug(Leader)
+			select {
+			case <-time.After(getHeartbeat()):
+				rf.debug("Sending heartbeat")
+			}
 		}
 	}
 }
@@ -290,7 +298,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.toFollower()
+	rf.toFollower(0)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
