@@ -78,7 +78,8 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state string // Follower or Candidate or Leader
+	state         string    // Follower or Candidate or Leader
+	electionWinCh chan bool // receives notification on winning elections
 
 	// persistent state
 	currentTerm int // currentTerm latest term server has seen (initialized to 0 on first boot, increases monotonically)
@@ -180,10 +181,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-// func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-// 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-// 	return ok
-// }
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -247,6 +248,47 @@ func (rf *Raft) toFollower(term int) {
 	rf.votedFor = -1
 }
 
+// non-blocking unbuffered notification to a channel
+func (rf *Raft) notify(ch chan bool) {
+	select {
+	case ch <- true:
+	default:
+	}
+}
+
+// assumes lock
+// sends the same set of args to all other servers to
+func (rf *Raft) broadcastRequestVotes() {
+	args := RequestVoteArgs{
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
+	}
+
+	for server := range rf.peers {
+		if server != rf.me {
+			go rf.sendRequestVote(server, &args, &RequestVoteReply{})
+		}
+	}
+}
+
+// assumes no lock
+func (rf *Raft) startElections() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.debug()
+
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	votes := 1
+
+	if votes == len(rf.peers)/2+1 {
+		go func() {
+			rf.notify(rf.electionWinCh)
+		}()
+	}
+
+}
+
 // assumes no lock. changes the state to the toState in a thread-safe way
 // checkout uber-go for this, later.
 func (rf *Raft) atomicStateChange(toState string) {
@@ -266,11 +308,17 @@ func (rf *Raft) loop() {
 			select {
 			case <-time.After(getElectionTimeout()):
 				rf.debug("Follower timeout")
+				rf.atomicStateChange(Candidate)
+				rf.startElections()
 			}
 		case Candidate:
 			select {
+			case <-rf.electionWinCh:
+				rf.debug("Won elections")
+				rf.atomicStateChange(Leader)
 			case <-time.After(getElectionTimeout()):
 				rf.debug("Candidate timeout")
+				rf.startElections()
 			}
 		case Leader:
 			select {
@@ -299,6 +347,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.toFollower(0)
+	rf.electionWinCh = make(chan bool)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
