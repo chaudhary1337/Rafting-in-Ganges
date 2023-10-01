@@ -80,24 +80,11 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state             string    // Follower or Candidate or Leader
-	votes             int       // number of votes gotten
-	detectElectionWin chan bool // receives notification on winning elections
-	detectHeartbeat   chan bool // disallows other channels to be reset
-	detectToFollower  chan bool // triggers/forces forces state change detection
-	detectValidVote   chan bool // disallows other channels to be reset
+	state string // Follower or Candidate or Leader
 
 	// persistent state
 	currentTerm int // currentTerm latest term server has seen (initialized to 0 on first boot, increases monotonically)
 	votedFor    int // candidateId that received vote in current term (or null if none)
-}
-
-// non blocking notify
-func (rf *Raft) notify(ch chan bool) {
-	select {
-	case ch <- true:
-	default:
-	}
 }
 
 // return currentTerm and whether this server
@@ -164,59 +151,18 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term     int // leader's term
+	LeaderId int // for follower to redirect clients
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term    int  // currentTerm for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
 // receiver implementation
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
-
-	// more to be added for 2B
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = true
-		return
-	}
-
-	// default case
-	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
-	return
-}
-
-// receiver implementation
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		return
-	}
-
-	// handle logic for wrong logs here
-
-	reply.Term = rf.currentTerm
-	reply.Success = true
-
-	if reply.Success {
-		rf.notify(rf.detectHeartbeat)
-	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -247,51 +193,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	// its fine if a server is not reachable
 	if ok := rf.peers[server].Call("Raft.RequestVote", args, reply); !ok {
 		return
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.debug()
-
-	// at wrong term
-	if rf.currentTerm != args.Term || reply.Term > rf.currentTerm {
-		rf.toFollower(reply.Term)
-		rf.notify(rf.detectToFollower)
-		return
-	}
-
-	if reply.VoteGranted {
-		rf.votes++
-	}
-
-	// only changed once
-	if rf.votes == len(rf.peers)/2+1 {
-		rf.state = Leader
-		rf.notify(rf.detectElectionWin)
-	}
-}
-
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// its fine if a server is not reachable
-	// FOR NOW
-	if ok := rf.peers[server].Call("Raft.AppendEntries", args, reply); !ok {
-		return
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.debug()
-
-	if rf.currentTerm != args.Term || reply.Term > rf.currentTerm {
-		rf.toFollower(reply.Term)
-		rf.notify(rf.detectToFollower)
-	}
-
-	if !reply.Success {
-		// logic to handle logs
 	}
 }
 
@@ -348,118 +251,8 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) resetChannels() {
-	rf.detectElectionWin = make(chan bool)
-	rf.detectHeartbeat = make(chan bool)
-	rf.detectToFollower = make(chan bool)
-	rf.detectValidVote = make(chan bool)
-}
-
-func (rf *Raft) toFollower(term int) {
-	rf.debug()
-	rf.resetChannels()
-
-	rf.state = Follower
-	rf.currentTerm = term
-	rf.votedFor = -1
-	rf.votes = 0 // shouldn't be needed, since candidate does its own
-}
-
-// assumes lock, broadcast votes to all servers
-func (rf *Raft) broadcastVotes() {
-	rf.debug()
-
-	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
-	}
-
-	for server := range rf.peers {
-		if server != rf.me {
-			go rf.sendRequestVote(server, &args, &RequestVoteReply{})
-		}
-	}
-}
-
-// converts to candidate, starts election by broadcasting votes
-func (rf *Raft) toCandidate() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.debug()
-	rf.resetChannels()
-
-	rf.state = Candidate
-	rf.currentTerm++
-	rf.votes = 1
-
-	rf.broadcastVotes()
-}
-
-// assumes lock
-func (rf *Raft) broadcastAppendEntries() {
-	rf.debug()
-
-	args := AppendEntriesArgs{}
-
-	for server := range rf.peers {
-		if server != rf.me {
-			go rf.sendAppendEntries(server, &args, &AppendEntriesReply{})
-		}
-	}
-
-}
-
-func (rf *Raft) toLeader() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.debug()
-	rf.resetChannels()
-	rf.broadcastAppendEntries()
-}
-
 func (rf *Raft) loop() {
 	for !rf.killed() {
-		rf.mu.Lock()
-		state := rf.state
-		rf.debug()
-		rf.mu.Unlock()
-
-		switch state {
-		case Follower:
-			select {
-			case <-rf.detectHeartbeat:
-				rf.debug("detected hearbeat")
-			case <-rf.detectValidVote:
-				rf.debug("detected valid vote")
-			case <-time.After(getElectionTimeout()):
-				rf.debug("detected election timeout")
-				rf.toCandidate()
-			}
-		case Candidate:
-			select {
-			case <-rf.detectElectionWin:
-				rf.debug("detected election win")
-				rf.toLeader()
-			case <-rf.detectHeartbeat:
-				rf.debug("detected hearbeat")
-			case <-rf.detectToFollower:
-				rf.debug("detected to follower")
-			case <-rf.detectValidVote:
-				rf.debug("detected valid vote")
-			case <-time.After(getElectionTimeout()):
-				rf.debug("detected election timeout")
-				rf.toCandidate()
-			}
-		case Leader:
-			select {
-			// add cases for other valid heartbeats, valid votes, if needed
-			case <-rf.detectToFollower:
-				rf.debug("detected to follower")
-			case <-time.After(getHeartbeat()):
-				rf.debug("detected heartbeat timeout")
-				rf.toLeader()
-			}
-		}
 	}
 }
 
@@ -480,8 +273,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.toFollower(0)
-	rf.resetChannels()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
