@@ -28,6 +28,21 @@ import (
 	"time"
 )
 
+func (rf *Raft) debug(args ...interface{}) {
+	counter, _, _, _ := runtime.Caller(1)
+	fullName := strings.Split(runtime.FuncForPC(counter).Name(), ".")
+	name := fullName[len(fullName)-1]
+
+	// return
+
+	indent := strings.Repeat("\t", 7*rf.me)
+	fmt.Printf("%s[S%d:%s:%d]{%s}", indent, rf.me, rf.state, rf.currentTerm, name)
+	for _, arg := range args {
+		fmt.Printf(" (%s)", arg)
+	}
+	fmt.Println()
+}
+
 const (
 	// states
 	Leader    = "Leader"
@@ -38,21 +53,6 @@ const (
 	ElectionBase = 400 // ~3x of heartbeat
 	ElectionVar  = 200 // introduces inconsistency in election timers
 )
-
-func (rf *Raft) debug(args ...interface{}) {
-	counter, _, _, _ := runtime.Caller(1)
-	fullName := strings.Split(runtime.FuncForPC(counter).Name(), ".")
-	name := fullName[len(fullName)-1]
-
-	return
-
-	indent := strings.Repeat("\t", 7*rf.me)
-	fmt.Printf("%s[S%d:%s:%d]{%s}", indent, rf.me, rf.state, rf.currentTerm, name)
-	for _, arg := range args {
-		fmt.Printf(" (%s)", arg)
-	}
-	fmt.Println()
-}
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -67,6 +67,11 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+}
+
+type LogEntry struct {
+	Command interface{} // each entry contains command for state machine,
+	Term    int         // and term when entry was received by leader (first index is 1)
 }
 
 // A Go object implementing a single Raft peer.
@@ -86,8 +91,17 @@ type Raft struct {
 	detectElectionWin chan bool // detects when converted to leader
 
 	// persistent state
-	currentTerm int // currentTerm latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor    int // candidateId that received vote in current term (or null if none)
+	currentTerm int      // currentTerm latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    int      // candidateId that received vote in current term (or null if none)
+	log         LogEntry // log entries
+
+	// volatile state
+	commitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	lastApplied int // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+
+	// volatile state for leader
+	nextIndex  []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
 // save Raft's persistent state to stable storage,
@@ -149,9 +163,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	// 2A
 	Term        int // candidate's term
 	CandidateId int // candidate who is requesting vote
+	// 2B
+	LastLogIndex int // index of candidate's last log entry
+	LastLogTerm  int // term of candidate's last log entry
 }
 
 // example RequestVote RPC reply structure.
