@@ -91,9 +91,9 @@ type Raft struct {
 	detectElectionWin chan bool // detects when converted to leader
 
 	// persistent state
-	currentTerm int      // currentTerm latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor    int      // candidateId that received vote in current term (or null if none)
-	log         LogEntry // log entries
+	currentTerm int        // currentTerm latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    int        // candidateId that received vote in current term (or null if none)
+	log         []LogEntry // log entries
 
 	// volatile state
 	commitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
@@ -163,10 +163,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
-	// 2A
-	Term        int // candidate's term
-	CandidateId int // candidate who is requesting vote
-	// 2B
+	Term         int // candidate's term
+	CandidateId  int // candidate who is requesting vote
 	LastLogIndex int // index of candidate's last log entry
 	LastLogTerm  int // term of candidate's last log entry
 }
@@ -174,7 +172,6 @@ type RequestVoteArgs struct {
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	// Your data here (2A).
 	Term        int  // currentTerm for the candidate to update itself
 	VoteGranted bool // true means the candidate received a vote
 }
