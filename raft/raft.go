@@ -314,22 +314,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return rf.getLastIndex(), rf.currentTerm, true
 }
 
-type AppendEntriesArgs struct {
-	// 2A
-	Term     int // leader's term
-	LeaderId int // for follower to redirect clients
-	// 2B
-	PrevLogIndex int        // index of log entry immediately preceding new ones
-	PrevLogTerm  int        // term of prevLogIndex entry
-	Entries      []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
-	LeaderCommit int        // leader's commitIndex
-}
-
-type AppendEntriesReply struct {
-	Term    int  // currentTerm for leader to update itself
-	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
-}
-
 // unlocked
 func (rf *Raft) apply() {
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
@@ -342,6 +326,26 @@ func (rf *Raft) apply() {
 			Command:      rf.log[rf.lastApplied].Command,
 		}
 	}
+}
+
+type AppendEntriesArgs struct {
+	// 2A
+	Term     int // leader's term
+	LeaderId int // for follower to redirect clients
+	// 2B
+	PrevLogIndex int        // index of log entry immediately preceding new ones
+	PrevLogTerm  int        // term of prevLogIndex entry
+	Entries      []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int        // leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	// 2A
+	Term    int  // currentTerm for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	// 2B
+	ConflictIndex int // earliest time for the same ConflictTerm
+	ConflictTerm  int // used for above
 }
 
 // receiver implementation
@@ -360,21 +364,35 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2B
 	// leader needs to back off
+	// case: there is no entry in log
 	if rf.getLastIndex() < args.PrevLogIndex {
 		rf.debug("no entry at PrevLogIndex/Term")
 		reply.Success = false
+		reply.ConflictIndex = rf.getLastIndex()
+		reply.ConflictTerm = -1
 		return
 	}
+	// case: there is entry, but its wrong
+	// the follower returns the earliest point (index) of the latest term
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		rf.debug("wrong entry at PrevLogIndex/Term")
 		reply.Success = false
+
+		lastTerm := rf.getLastTerm()
+		index := rf.getLastIndex()
+		for index > 0 && lastTerm == rf.log[index].Term {
+			index--
+		}
+		reply.ConflictIndex = index + 1
+		reply.ConflictTerm = lastTerm
+
 		return
 	}
 
 	// leader is send right entries, they need to be written
 	rf.debug("curr", rf.log)
 	for i := 0; i < len(args.Entries); i++ {
-		log_i := args.PrevLogIndex + i
+		log_i := args.PrevLogIndex + i + 1
 
 		if rf.getLastIndex() < log_i {
 			// if no data present, add
@@ -393,6 +411,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// update commitIndex
 	if args.LeaderCommit > rf.commitIndex {
+		rf.debug("updating commitIndex")
 		rf.commitIndex = min(args.LeaderCommit, rf.getLastIndex())
 	}
 
@@ -422,7 +441,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.debug("leader no more/term mismatch")
 		return
 	}
-
 	if reply.Term > rf.currentTerm {
 		rf.debug("stale leader (me)")
 		rf.toFollower(reply.Term)
@@ -432,17 +450,48 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	// 2B
 	// log checks
 	if !reply.Success {
-		// very basic backing off,
-		// will wait for next turn to handle this for now
-		rf.nextIndex[server]--
+		// log entry is not present,
+		// the follower tells to supply logs from ConflictIndex,
+		// which is where its log ends
+		if reply.ConflictTerm == -1 {
+			rf.nextIndex[server] = reply.ConflictIndex
+			rf.matchIndex[server] = rf.nextIndex[server] - 1
+			return
+		}
+
+		// if entry is present, but wrong,
+		// we find the latest index of this ConflictTerm
+		lastValid := 0
+		for index := 1; index <= rf.getLastIndex(); index++ {
+			if rf.log[index].Term == reply.ConflictTerm {
+				lastValid = index
+			}
+		}
+
+		// if that ConflictTerm exists, okay
+		// if it does not exist, we directly use the ConflictIndex
+		if lastValid != 0 {
+			rf.nextIndex[server] = lastValid + 1
+		} else {
+			rf.nextIndex[server] = reply.ConflictIndex
+		}
+
+		rf.matchIndex[server] = rf.nextIndex[server] - 1
 		return
 	}
 
-	// update matchIndex if reply.Success
+	// update matchIndex and nextIndex if reply.Success
 	rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+	rf.nextIndex[server] = rf.matchIndex[server] + 1
 
 	// see if leader can update its commitIndex to move forward
-	for N := rf.commitIndex; N < len(rf.log); N++ {
+	for N := rf.commitIndex + 1; N < len(rf.log); N++ {
+		// if term does not match, we can't do anything
+		if rf.log[N].Term != rf.currentTerm {
+			continue
+		}
+
+		// same term, same leader, means I (leader) am the one committing
 		count := 0
 		for server := range rf.peers {
 			if rf.matchIndex[server] >= N {
@@ -494,7 +543,7 @@ func (rf *Raft) toLeader(firstTime bool) {
 			// 2B
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  rf.log[prevLogIndex].Term,
-			Entries:      rf.log[prevLogIndex:],
+			Entries:      rf.log[prevLogIndex+1:],
 			LeaderCommit: rf.commitIndex,
 		}
 
@@ -508,28 +557,28 @@ func (rf *Raft) loop() {
 		case Follower:
 			select {
 			case <-rf.detectFollower:
-				// rf.debug("detected follower")
+				rf.debug("detected follower")
 			case <-time.After(getElectionTimeout()):
-				// rf.debug("election timer")
+				rf.debug("election timer")
 				rf.toCandidate()
 			}
 		case Candidate:
 			select {
 			case <-rf.detectFollower:
-				// rf.debug("detected follower")
+				rf.debug("detected follower")
 			case <-rf.detectElectionWin:
-				// rf.debug("won elections")
+				rf.debug("won elections")
 				rf.toLeader(true)
 			case <-time.After(getElectionTimeout()):
-				// rf.debug("election timer")
+				rf.debug("election timer")
 				rf.toCandidate()
 			}
 		case Leader:
 			select {
 			case <-rf.detectFollower:
-				// rf.debug("detected follower")
+				rf.debug("detected follower")
 			case <-time.After(getHeartbeat()):
-				// rf.debug("heartbeat")
+				rf.debug("heartbeat")
 				rf.toLeader(false)
 			}
 		}
@@ -560,6 +609,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.log = append(rf.log, LogEntry{Term: -1}) // starts with index 1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.resetChannels()
 	rf.toFollower(0)
 
