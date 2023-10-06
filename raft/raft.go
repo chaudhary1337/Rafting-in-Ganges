@@ -441,7 +441,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		}
 
 		// the last majority supported N is taken as commitIndex
-		if count > len(rf.peers)/2 {
+		if count >= len(rf.peers)/2 {
 			rf.commitIndex = N
 			break
 		}
