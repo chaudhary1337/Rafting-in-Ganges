@@ -283,49 +283,6 @@ func (rf *Raft) toCandidate() {
 
 // ============================== AppendEntries RPC Logic ==============================
 
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.state != Leader {
-		return -1, -1, false
-	}
-
-	rf.log = append(rf.log, LogEntry{
-		Term:    rf.currentTerm,
-		Command: command,
-	})
-
-	rf.debug("leader", rf.log)
-	return rf.getLastIndex(), rf.currentTerm, true
-}
-
-// unlocked
-func (rf *Raft) apply() {
-	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
-	for rf.commitIndex > rf.lastApplied {
-		rf.lastApplied++
-
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			CommandIndex: rf.lastApplied,
-			Command:      rf.log[rf.lastApplied].Command,
-		}
-	}
-}
-
 type AppendEntriesArgs struct {
 	// 2A
 	Term     int // leader's term
@@ -361,62 +318,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// 2B
-	// leader needs to back off
-	// case: there is no entry in log
 	if rf.getLastIndex() < args.PrevLogIndex {
-		rf.debug("no entry at PrevLogIndex/Term")
+		rf.debug("no entry at PrevLogIndex")
 		reply.Success = false
 		reply.ConflictIndex = rf.getLastIndex()
 		reply.ConflictTerm = -1
 		return
 	}
-	// case: there is entry, but its wrong
-	// the follower returns the earliest point (index) of the latest term
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		rf.debug("wrong entry at PrevLogIndex/Term")
+		rf.debug("wrong entry at PrevLogIndex")
 		reply.Success = false
 
 		lastTerm := rf.getLastTerm()
-		firstValid := rf.getLastIndex()
-		for index := rf.getLastIndex(); index > 0; index-- {
-			if lastTerm == rf.log[index].Term {
-				firstValid = index
-			}
-
-		}
+		firstValid := rf.findLogMatch(false, lastTerm)
 		reply.ConflictIndex = firstValid
 		reply.ConflictTerm = lastTerm
 		return
 	}
 
 	// leader is send right entries, they need to be written
-	rf.debug("curr", rf.log)
 	for i := 0; i < len(args.Entries); i++ {
-		log_i := args.PrevLogIndex + i + 1
+		log_i := args.PrevLogIndex + 1 + i
 
+		// if no data present, add
 		if rf.getLastIndex() < log_i {
-			// if no data present, add
-			rf.debug("append")
 			rf.log = append(rf.log, args.Entries[i])
-		} else if args.Entries[i].Term != rf.log[log_i].Term {
-			// exclude this term
-			rf.debug("fix")
+			continue
+		}
+
+		// exclude this term and beyond
+		// and add this new entry
+		if args.Entries[i].Term != rf.log[log_i].Term {
 			rf.log = rf.log[:log_i]
-		} else {
-			// if term match, okay!
-			rf.debug("match")
+			rf.log = append(rf.log, args.Entries[i])
+			continue
 		}
 	}
-	rf.debug("fixed", rf.log)
 
-	// update commitIndex
 	if args.LeaderCommit > rf.commitIndex {
 		rf.debug("updating commitIndex")
 		rf.commitIndex = min(args.LeaderCommit, rf.getLastIndex())
 	}
 
 	// apply
-	rf.apply()
+	go rf.apply()
 
 	// defaults
 	reply.Success = true
@@ -462,12 +407,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 		// if entry is present, but wrong,
 		// we find the latest index of this ConflictTerm
-		lastValid := 0
-		for index := 1; index <= rf.getLastIndex(); index++ {
-			if rf.log[index].Term == reply.ConflictTerm {
-				lastValid = index
-			}
-		}
+		lastValid := rf.findLogMatch(true, reply.ConflictTerm)
 
 		// if that ConflictTerm exists, okay
 		// if it does not exist, we directly use the ConflictIndex
@@ -485,13 +425,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	rf.nextIndex[server] = rf.matchIndex[server] + 1
 
 	// see if leader can update its commitIndex to move forward
-	for N := rf.commitIndex + 1; N < len(rf.log); N++ {
+	// we start from the end to see if we can move it all the way to the log length
+	for N := rf.getLastIndex(); N >= rf.commitIndex+1; N-- {
 		// if term does not match, we can't do anything
 		if rf.log[N].Term != rf.currentTerm {
 			continue
 		}
 
-		// same term, same leader, means I (leader) am the one committing
+		// same term -means-> same leader, means I (leader) am the one committing
 		count := 0
 		for server := range rf.peers {
 			if rf.matchIndex[server] >= N {
@@ -502,11 +443,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		// the last majority supported N is taken as commitIndex
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = N
+			break
 		}
 	}
 
 	// apply
-	rf.apply()
+	go rf.apply()
 }
 
 func (rf *Raft) toLeader(firstTime bool) {
@@ -624,6 +566,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+// ============================== General Helpers Logic ==============================
+
 // the tester calls Kill() when a Raft instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -696,6 +640,8 @@ func getHeartbeat() time.Duration {
 	return time.Duration(HeartBeat) * time.Millisecond
 }
 
+// ============================== Log Helpers Logic ==============================
+
 // unlocked
 func (rf *Raft) getLastIndex() int {
 	return len(rf.log) - 1
@@ -716,4 +662,73 @@ func (rf *Raft) isUpToDate(args *RequestVoteArgs) bool {
 	}
 
 	return rf.getLastIndex() <= args.LastLogIndex
+}
+
+// the service using Raft (e.g. a k/v server) wants to start
+// agreement on the next command to be appended to Raft's log. if this
+// server isn't the leader, returns false. otherwise start the
+// agreement and return immediately. there is no guarantee that this
+// command will ever be committed to the Raft log, since the leader
+// may fail or lose an election. even if the Raft instance has been killed,
+// this function should return gracefully.
+//
+// the first return value is the index that the command will appear at
+// if it's ever committed. the second return value is the current
+// term. the third return value is true if this server believes it is
+// the leader.
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state != Leader {
+		return -1, -1, false
+	}
+
+	rf.log = append(rf.log, LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	})
+
+	// rf.debug("leader", rf.log)
+	return rf.getLastIndex(), rf.currentTerm, true
+}
+
+// locked. moves lastApplied to commitIndex
+func (rf *Raft) apply() {
+	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// rf.debug(rf.commitIndex, rf.lastApplied)
+
+	for rf.commitIndex > rf.lastApplied {
+		rf.lastApplied++
+
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			CommandIndex: rf.lastApplied,
+			Command:      rf.log[rf.lastApplied].Command,
+		}
+	}
+}
+
+// unlocked. gets the lastMatch/first match value from log (with term)
+func (rf *Raft) findLogMatch(lastMatch bool, term int) int {
+	if lastMatch {
+		value := 0
+		for index := 1; index <= rf.getLastIndex(); index++ {
+			if rf.log[index].Term == term {
+				value = index
+			}
+		}
+		return value
+	} else {
+		value := rf.getLastIndex() + 1
+		for index := rf.getLastIndex(); index >= 1; index-- {
+			if rf.log[index].Term == term {
+				value = index
+			}
+		}
+		return value
+	}
 }
