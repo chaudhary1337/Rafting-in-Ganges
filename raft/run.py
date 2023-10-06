@@ -43,5 +43,5 @@ if __name__ == "__main__":
     print(
         f"\n[{part}] Passed: {d[0]}/{tests}"
         f"\n[{part}] Failed: {d[1]}/{tests}"
-        f"\n[{part}] Time: {end-start}"
+        f"\n[{part}] Average time: {(end-start)/tests}"
     )
