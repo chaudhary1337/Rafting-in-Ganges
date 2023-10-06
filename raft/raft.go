@@ -478,6 +478,12 @@ func (rf *Raft) toLeader(firstTime bool) {
 
 		prevLogIndex := rf.nextIndex[server] - 1
 
+		// making copy
+		entries := make([]LogEntry, 0)
+		for _, entry := range rf.log[prevLogIndex+1:] {
+			entries = append(entries, entry)
+		}
+
 		// preparing individual args
 		args := AppendEntriesArgs{
 			// 2A
@@ -486,7 +492,7 @@ func (rf *Raft) toLeader(firstTime bool) {
 			// 2B
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  rf.log[prevLogIndex].Term,
-			Entries:      rf.log[prevLogIndex+1:],
+			Entries:      entries,
 			LeaderCommit: rf.commitIndex,
 		}
 
@@ -715,20 +721,20 @@ func (rf *Raft) apply() {
 // unlocked. gets the lastMatch/first match value from log (with term)
 func (rf *Raft) findLogMatch(lastMatch bool, term int) int {
 	if lastMatch {
-		value := 0
-		for index := 1; index <= rf.getLastIndex(); index++ {
-			if rf.log[index].Term == term {
-				value = index
-			}
-		}
-		return value
-	} else {
-		value := rf.getLastIndex() + 1
 		for index := rf.getLastIndex(); index >= 1; index-- {
 			if rf.log[index].Term == term {
-				value = index
+				return index
 			}
 		}
-		return value
+
+		return 0
+	} else {
+		for index := 1; index <= rf.getLastIndex(); index++ {
+			if rf.log[index].Term == term {
+				return index
+			}
+		}
+
+		return rf.getLastIndex() + 1
 	}
 }
