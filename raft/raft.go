@@ -296,8 +296,6 @@ func (rf *Raft) toCandidate() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	// return -1, -1, true // defaults
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -379,13 +377,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 
 		lastTerm := rf.getLastTerm()
-		index := rf.getLastIndex()
-		for index > 0 && lastTerm == rf.log[index].Term {
-			index--
-		}
-		reply.ConflictIndex = index + 1
-		reply.ConflictTerm = lastTerm
+		firstValid := rf.getLastIndex()
+		for index := rf.getLastIndex(); index > 0; index-- {
+			if lastTerm == rf.log[index].Term {
+				firstValid = index
+			}
 
+		}
+		reply.ConflictIndex = firstValid
+		reply.ConflictTerm = lastTerm
 		return
 	}
 
@@ -449,13 +449,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	// 2B
 	// log checks
+
+	// if reply is not Success, then we can't update matchIndex, since we are yet to match and confirm logs
 	if !reply.Success {
 		// log entry is not present,
 		// the follower tells to supply logs from ConflictIndex,
 		// which is where its log ends
 		if reply.ConflictTerm == -1 {
 			rf.nextIndex[server] = reply.ConflictIndex
-			rf.matchIndex[server] = rf.nextIndex[server] - 1
 			return
 		}
 
@@ -476,7 +477,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			rf.nextIndex[server] = reply.ConflictIndex
 		}
 
-		rf.matchIndex[server] = rf.nextIndex[server] - 1
 		return
 	}
 
@@ -499,6 +499,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			}
 		}
 
+		// the last majority supported N is taken as commitIndex
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = N
 		}
