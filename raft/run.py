@@ -1,23 +1,47 @@
 import subprocess
-import os
 import p_tqdm
+import sys
+import time
 
 
 def test(part):
     command = ["go", "test", "-run", part, "-race"]
-    process = subprocess.run(args=command, stdout=subprocess.DEVNULL)
+    process = subprocess.run(
+        args=command,
+        # stdout=subprocess.DEVNULL,
+    )
 
     return process.returncode
 
 
-if __name__ == "__main__":
-    part = "2B"
-    tests = 50
+def sequential(part, tests, d):
+    for _ in range(tests):
+        returncode = test(part)
+        d[returncode] += 1
+        print(f"Passed: {d[0]}, Failed: {d[1]}")
+    return
 
-    d = {0: 0, 1: 0}
+
+def parallel(part, tests, d):
     for returncode in p_tqdm.p_uimap(test, [part] * tests):
         d[returncode] += 1
-        os.system("clear")
         print(f"Passed: {d[0]}, Failed: {d[1]}")
+    return
 
-    print(f"\n[{part}] Passed: {d[0]}/{tests}\n[{[part]}] Failed: {d[1]}/{tests}")
+
+if __name__ == "__main__":
+    part = sys.argv[1]  # "2B"
+    tests = int(sys.argv[2])  # multiple of 8 preferably
+
+    d = {0: 0, 1: 0}
+
+    start = time.time()
+    # sequential(part, tests, d)
+    parallel(part, tests, d)
+    end = time.time()
+
+    print(
+        f"\n[{part}] Passed: {d[0]}/{tests}"
+        f"\n[{part}] Failed: {d[1]}/{tests}"
+        f"\n[{part}] Time: {end-start}"
+    )
