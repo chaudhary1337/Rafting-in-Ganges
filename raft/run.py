@@ -32,12 +32,16 @@ def parallel(part, tests, d):
 if __name__ == "__main__":
     part = sys.argv[1]  # "2B"
     tests = int(sys.argv[2])  # multiple of 8 preferably
+    method = sys.argv[3]  # "par"-allel or "seq"-uential
 
     d = {0: 0, 1: 0}
 
     start = time.time()
-    # sequential(part, tests, d)
-    parallel(part, tests, d)
+    match method:
+        case "seq":
+            sequential(part, tests, d)
+        case "par":
+            parallel(part, tests, d)
     end = time.time()
 
     print(
