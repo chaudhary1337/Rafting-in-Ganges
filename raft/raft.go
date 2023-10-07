@@ -51,9 +51,9 @@ const (
 	Candidate = "Candidate"
 	Follower  = "Follower"
 	// times
-	HeartBeat    = 120 // the minimum possible amount for the tester
-	ElectionBase = 400 // ~3x of heartbeat
-	ElectionVar  = 200 // introduces inconsistency in election timers
+	HeartBeat    = 100 // the minimum possible amount for the tester
+	ElectionBase = 350 // ~3x of heartbeat
+	ElectionVar  = 250 // introduces inconsistency in election timers
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -306,32 +306,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// leader is send right entries, they need to be written
+	// leader sent right entries, they need to be written
 	for i := 0; i < len(args.Entries); i++ {
 		log_i := args.PrevLogIndex + 1 + i
 
 		// if no data present, add
 		if rf.getLastIndex() < log_i {
-			rf.log = append(rf.log, args.Entries[i])
-			continue
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
 		}
 
 		// exclude this term and beyond
 		// and add this new entry
 		if args.Entries[i].Term != rf.log[log_i].Term {
-			rf.log = rf.log[:log_i]
-			rf.log = append(rf.log, args.Entries[i])
-			continue
+			rf.log = append(rf.log[:log_i], args.Entries[i:]...)
+			break
 		}
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.debug("updating commitIndex")
 		rf.commitIndex = min(args.LeaderCommit, rf.getLastIndex())
-	}
 
-	// apply
-	go rf.apply()
+		// apply
+		go rf.apply()
+	}
 
 	// defaults
 	reply.Success = true
@@ -368,26 +367,27 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	// if reply is not Success, then we can't update matchIndex, since we are yet to match and confirm logs
 	if !reply.Success {
-		// log entry is not present,
-		// the follower tells to supply logs from ConflictIndex,
-		// which is where its log ends
 		if reply.ConflictTerm == -1 {
+			// log entry is not present,
+			// the follower tells to supply logs from ConflictIndex,
+			// which is where its log ends
 			rf.nextIndex[server] = reply.ConflictIndex
-			return
-		}
-
-		// if entry is present, but wrong,
-		// we find the latest index of this ConflictTerm
-		lastValid := rf.findLogMatch(true, reply.ConflictTerm)
-
-		// if that ConflictTerm exists, okay
-		// if it does not exist, we directly use the ConflictIndex
-		if lastValid != 0 {
-			rf.nextIndex[server] = lastValid + 1
 		} else {
-			rf.nextIndex[server] = reply.ConflictIndex
+			// if entry is present, but wrong,
+			// we find the latest index of this ConflictTerm
+			lastValid := rf.findLogMatch(true, reply.ConflictTerm)
+
+			// if that ConflictTerm exists, okay
+			// if it does not exist, we directly use the ConflictIndex
+			if lastValid != 0 {
+				rf.nextIndex[server] = lastValid + 1
+			} else {
+				rf.nextIndex[server] = reply.ConflictIndex
+			}
 		}
 
+		// sending another append entry separately
+		rf.prepareAppendEntries(server)
 		return
 	}
 
@@ -414,12 +414,35 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		// the last majority supported N is taken as commitIndex
 		if count >= len(rf.peers)/2 {
 			rf.commitIndex = N
+			// apply
+			go rf.apply()
 			break
 		}
 	}
+}
 
-	// apply
-	go rf.apply()
+// unlocked
+func (rf *Raft) prepareAppendEntries(server int) {
+	prevLogIndex := rf.nextIndex[server] - 1
+
+	// making copy
+	remaining := rf.log[prevLogIndex+1:]
+	entries := make([]LogEntry, len(remaining))
+	copy(entries, remaining)
+
+	// preparing individual args
+	args := AppendEntriesArgs{
+		// 2A
+		Term:     rf.currentTerm,
+		LeaderId: rf.me,
+		// 2B
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  rf.log[prevLogIndex].Term,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+
+	go rf.sendAppendEntries(server, &args, &AppendEntriesReply{})
 }
 
 func (rf *Raft) toLeader(firstTime bool) {
@@ -446,28 +469,7 @@ func (rf *Raft) toLeader(firstTime bool) {
 		if server == rf.me {
 			continue
 		}
-
-		prevLogIndex := rf.nextIndex[server] - 1
-
-		// making copy
-		entries := make([]LogEntry, 0)
-		for _, entry := range rf.log[prevLogIndex+1:] {
-			entries = append(entries, entry)
-		}
-
-		// preparing individual args
-		args := AppendEntriesArgs{
-			// 2A
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
-			// 2B
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  rf.log[prevLogIndex].Term,
-			Entries:      entries,
-			LeaderCommit: rf.commitIndex,
-		}
-
-		go rf.sendAppendEntries(server, &args, &AppendEntriesReply{})
+		rf.prepareAppendEntries(server)
 	}
 }
 
