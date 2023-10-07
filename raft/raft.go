@@ -31,11 +31,11 @@ import (
 )
 
 func (rf *Raft) debug(args ...interface{}) {
+	return
+
 	counter, _, _, _ := runtime.Caller(1)
 	fullName := strings.Split(runtime.FuncForPC(counter).Name(), ".")
 	name := fullName[len(fullName)-1]
-
-	return
 
 	indent := strings.Repeat("\t", rf.me)
 	fmt.Printf("%s[S%d:%s:%d]{%s}", indent, rf.me, rf.state, rf.currentTerm, name)
@@ -385,15 +385,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				rf.nextIndex[server] = reply.ConflictIndex
 			}
 		}
+		rf.matchIndex[server] = rf.nextIndex[server] - 1
 
 		// sending another append entry separately
 		rf.prepareAppendEntries(server)
-		return
+	} else {
+		// update matchIndex and nextIndex if reply.Success
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	}
-
-	// update matchIndex and nextIndex if reply.Success
-	rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-	rf.nextIndex[server] = rf.matchIndex[server] + 1
 
 	// see if leader can update its commitIndex to move forward
 	// we start from the end to see if we can move it all the way to the log length
@@ -404,15 +404,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		}
 
 		// same term -means-> same leader, means I (leader) am the one committing
-		count := 0
+		count := 1
 		for server := range rf.peers {
-			if rf.matchIndex[server] >= N {
+			if server != rf.me && rf.matchIndex[server] >= N {
 				count++
 			}
 		}
 
 		// the last majority supported N is taken as commitIndex
-		if count >= len(rf.peers)/2 {
+		if count > len(rf.peers)/2 {
 			rf.commitIndex = N
 			// apply
 			go rf.apply()
@@ -457,9 +457,10 @@ func (rf *Raft) toLeader(firstTime bool) {
 		// reinit on first time
 		rf.nextIndex = make([]int, len(rf.peers))
 		rf.matchIndex = make([]int, len(rf.peers))
+		lastIndex := rf.getLastIndex()
 
 		for server := range rf.peers {
-			rf.nextIndex[server] = rf.getLastIndex() + 1
+			rf.nextIndex[server] = lastIndex + 1
 			rf.matchIndex[server] = 0
 		}
 	}
@@ -507,11 +508,6 @@ func (rf *Raft) loop() {
 	}
 }
 
-func (rf *Raft) resetChannels() {
-	rf.detectFollower = make(chan bool)
-	rf.detectElectionWin = make(chan bool)
-}
-
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -532,7 +528,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.log = append(rf.log, LogEntry{Term: -1}) // starts with index 1
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.resetChannels()
+	rf.detectFollower = make(chan bool)
+	rf.detectElectionWin = make(chan bool)
 	rf.toFollower(0)
 
 	// initialize from state persisted before a crash
@@ -580,14 +577,6 @@ func (rf *Raft) loadState() string {
 	defer rf.mu.Unlock()
 
 	return rf.state
-}
-
-// locks and changes state
-func (rf *Raft) setState(state string) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.state = state
 }
 
 // non-blocking send for unbuffered channel
