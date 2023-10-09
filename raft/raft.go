@@ -406,10 +406,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				rf.nextIndex[server] = reply.ConflictIndex
 			}
 		}
-		rf.matchIndex[server] = rf.nextIndex[server] - 1
+
+		// can't update matchIndex since we still don't know if they match till nextIndex[server] - 1.``
 	} else {
 		// update matchIndex and nextIndex if reply.Success
-		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		if rf.matchIndex[server] < args.PrevLogIndex+len(args.Entries) {
+			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		}
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	}
 
@@ -485,7 +488,7 @@ func (rf *Raft) toLeader(firstTime bool) {
 
 		for server := range rf.peers {
 			rf.nextIndex[server] = lastIndex + 1
-			rf.matchIndex[server] = 0
+			rf.matchIndex[server] = -1
 		}
 	}
 
