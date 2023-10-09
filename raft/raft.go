@@ -52,8 +52,8 @@ const (
 	Follower  = "Follower"
 	// times
 	HeartBeat    = 100 // the minimum possible amount for the tester
-	ElectionBase = 350 // ~3x of heartbeat
-	ElectionVar  = 250 // introduces inconsistency in election timers
+	ElectionBase = 310 // ~3x of heartbeat
+	ElectionVar  = 190 // introduces inconsistency in election timers
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -294,7 +294,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.getLastIndex() < args.PrevLogIndex {
 		rf.debug("no entry at PrevLogIndex")
 		reply.Success = false
-		reply.ConflictIndex = rf.getLastIndex()
+		reply.ConflictIndex = rf.getLastIndex() + 1
 		reply.ConflictTerm = -1
 		return
 	}
