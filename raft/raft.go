@@ -145,9 +145,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2A && 2B
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isUpToDate(args) {
 		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
 
 		rf.debug("good citizen")
-		rf.toFollower(args.Term)
+		rf.toFollower(args.Term, args.CandidateId)
 		return
 	}
 
@@ -284,6 +285,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		rf.debug("stale leader")
 		reply.Success = false
+		reply.ConflictIndex = -1
+		reply.ConflictTerm = -1
 		return
 	}
 
@@ -297,32 +300,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		rf.debug("wrong entry at PrevLogIndex")
-		reply.Success = false
 
 		lastTerm := rf.getLastTerm()
 		firstValid := rf.findLogMatch(false, lastTerm)
+
+		reply.Success = false
 		reply.ConflictIndex = firstValid
 		reply.ConflictTerm = lastTerm
 		return
 	}
 
-	// leader sent right entries, they need to be written
-	for i := 0; i < len(args.Entries); i++ {
-		log_i := args.PrevLogIndex + 1 + i
+	// if the log is smaller or equal in size, we can just add/overwrite entries directly
+	if rf.getLastIndex() <= args.PrevLogIndex+len(args.Entries) {
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	} else {
+		for i := 0; i < len(args.Entries); i++ {
+			log_i := args.PrevLogIndex + 1 + i
 
-		// if no data present, add
-		if rf.getLastIndex() < log_i {
-			rf.log = append(rf.log, args.Entries[i:]...)
-			break
-		}
-
-		// exclude this term and beyond
-		// and add this new entry
-		if args.Entries[i].Term != rf.log[log_i].Term {
-			rf.log = append(rf.log[:log_i], args.Entries[i:]...)
-			break
+			// exclude this term and beyond, since its incorrect
+			// and add this new entry
+			if args.Entries[i].Term != rf.log[log_i].Term {
+				rf.log = append(rf.log[:log_i], args.Entries[i:]...)
+				break
+			}
 		}
 	}
+
+	// old logic
+	// // leader sent right entries, they need to be written
+	// for i := 0; i < len(args.Entries); i++ {
+	// 	log_i := args.PrevLogIndex + 1 + i
+
+	// 	// if no data present, add
+	// 	if rf.getLastIndex() < log_i {
+	// 		rf.log = append(rf.log, args.Entries[i:]...)
+	// 		break
+	// 	}
+
+	// 	// exclude this term and beyond
+	// 	// and add this new entry
+	// 	if args.Entries[i].Term != rf.log[log_i].Term {
+	// 		rf.log = append(rf.log[:log_i], args.Entries[i:]...)
+	// 		break
+	// 	}
+	// }
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.debug("updating commitIndex")
@@ -348,17 +369,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
 
 	// 2A
 	// state and term checks
-	if rf.state != Leader || args.Term != rf.currentTerm || reply.Term < rf.currentTerm {
+	if rf.state != Leader || args.Term != rf.currentTerm {
 		rf.debug("leader no more/term mismatch")
 		return
 	}
 	if reply.Term > rf.currentTerm {
 		rf.debug("stale leader (me)")
 		rf.toFollower(reply.Term)
+		rf.persist()
 		return
 	}
 
@@ -386,9 +407,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			}
 		}
 		rf.matchIndex[server] = rf.nextIndex[server] - 1
-
-		// sending another append entry separately
-		rf.prepareAppendEntries(server)
 	} else {
 		// update matchIndex and nextIndex if reply.Success
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
@@ -419,6 +437,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			break
 		}
 	}
+
+	// sending another append entry separately
+	// instead of waiting for the next heartbeat
+	// we send this after leader's commitIndex has possibly been updated
+	if !reply.Success {
+		rf.prepareAppendEntries(server)
+	}
 }
 
 // unlocked
@@ -426,9 +451,8 @@ func (rf *Raft) prepareAppendEntries(server int) {
 	prevLogIndex := rf.nextIndex[server] - 1
 
 	// making copy
-	remaining := rf.log[prevLogIndex+1:]
-	entries := make([]LogEntry, len(remaining))
-	copy(entries, remaining)
+	entries := []LogEntry{}
+	entries = append(entries, rf.log[prevLogIndex+1:]...)
 
 	// preparing individual args
 	args := AppendEntriesArgs{
@@ -553,7 +577,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 // to suppress debug output from a Kill()ed instance.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 }
 
 func (rf *Raft) killed() bool {
@@ -588,10 +611,19 @@ func (rf *Raft) notify(ch chan bool) {
 }
 
 // unlocked and resets follower
-func (rf *Raft) toFollower(term int) {
+func (rf *Raft) toFollower(params ...int) {
 	rf.state = Follower
-	rf.currentTerm = term
-	rf.votedFor = -1
+
+	if len(params) < 1 {
+		panic("toFollower needs a term supplied always")
+	}
+	rf.currentTerm = params[0]
+
+	if len(params) > 1 {
+		rf.votedFor = params[1]
+	} else {
+		rf.votedFor = -1
+	}
 
 	rf.notify(rf.detectFollower)
 }
@@ -626,9 +658,9 @@ func (rf *Raft) isUpToDate(args *RequestVoteArgs) bool {
 
 	if rf.getLastTerm() != args.LastLogTerm {
 		return rf.getLastTerm() < args.LastLogTerm
+	} else {
+		return rf.getLastIndex() <= args.LastLogIndex
 	}
-
-	return rf.getLastIndex() <= args.LastLogIndex
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -682,8 +714,10 @@ func (rf *Raft) apply() {
 
 // unlocked. gets the lastMatch/first match value from log (with term)
 func (rf *Raft) findLogMatch(lastMatch bool, term int) int {
+	lastIndex := rf.getLastIndex()
+
 	if lastMatch {
-		for index := rf.getLastIndex(); index >= 1; index-- {
+		for index := lastIndex; index >= 1; index-- {
 			if rf.log[index].Term == term {
 				return index
 			}
@@ -691,13 +725,13 @@ func (rf *Raft) findLogMatch(lastMatch bool, term int) int {
 
 		return 0
 	} else {
-		for index := 1; index <= rf.getLastIndex(); index++ {
+		for index := 1; index <= lastIndex; index++ {
 			if rf.log[index].Term == term {
 				return index
 			}
 		}
 
-		return rf.getLastIndex() + 1
+		return lastIndex + 1
 	}
 }
 
