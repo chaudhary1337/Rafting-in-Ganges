@@ -136,18 +136,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
-		reply.VoteGranted = false
-
 		rf.debug("stale candidate")
+
+		reply.VoteGranted = false
 		return
 	}
 
 	// 2A && 2B
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isUpToDate(args) {
+		rf.debug("good citizen")
+
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
-
-		rf.debug("good citizen")
 		rf.toFollower(args.Term, args.CandidateId)
 		return
 	}
@@ -293,6 +293,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 2B
 	if rf.getLastIndex() < args.PrevLogIndex {
 		rf.debug("no entry at PrevLogIndex")
+
 		reply.Success = false
 		reply.ConflictIndex = rf.getLastIndex() + 1
 		reply.ConflictTerm = -1
@@ -350,6 +351,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	// 2A
 	// state and term checks
@@ -360,7 +362,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if reply.Term > rf.currentTerm {
 		rf.debug("stale leader (me)")
 		rf.toFollower(reply.Term)
-		rf.persist()
 		return
 	}
 
@@ -388,46 +389,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			}
 		}
 
-		// can't update matchIndex since we still don't know if they match till nextIndex[server] - 1.``
-	} else {
-		// update matchIndex and nextIndex if reply.Success
-		if rf.matchIndex[server] < args.PrevLogIndex+len(args.Entries) {
-			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-		}
-		rf.nextIndex[server] = rf.matchIndex[server] + 1
-	}
-
-	// see if leader can update its commitIndex to move forward
-	// we start from the end to see if we can move it all the way to the log length
-	for N := rf.getLastIndex(); N >= rf.commitIndex+1; N-- {
-		// if term does not match, we can't do anything
-		if rf.log[N].Term != rf.currentTerm {
-			continue
-		}
-
-		// same term -means-> same leader, means I (leader) am the one committing
-		count := 1
-		for server := range rf.peers {
-			if server != rf.me && rf.matchIndex[server] >= N {
-				count++
-			}
-		}
-
-		// the last majority supported N is taken as commitIndex
-		if count > len(rf.peers)/2 {
-			rf.commitIndex = N
-			// apply
-			go rf.apply()
-			break
-		}
-	}
-
-	// sending another append entry separately
-	// instead of waiting for the next heartbeat
-	// we send this after leader's commitIndex has possibly been updated
-	if !reply.Success {
+		// can't update matchIndex since we still don't know if they match till nextIndex[server] - 1.
+		// sending another append entry separately
+		// instead of waiting for the next heartbeat
 		rf.prepareAppendEntries(server)
+		return
 	}
+
+	// update matchIndex and nextIndex if reply.Success
+	if rf.matchIndex[server] < args.PrevLogIndex+len(args.Entries) {
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+	}
+	rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+	rf.updateCommitIndex()
 }
 
 // unlocked
@@ -481,6 +456,8 @@ func (rf *Raft) toLeader(firstTime bool) {
 		rf.prepareAppendEntries(server)
 	}
 }
+
+// ============================== MAIN Logic ==============================
 
 func (rf *Raft) loop() {
 	for !rf.killed() {
@@ -718,7 +695,35 @@ func (rf *Raft) findLogMatch(lastMatch bool, term int) int {
 	}
 }
 
-// ============================== Persisters ==============================
+// unlocked. moves the commit index ahead if it can, and applies state changes if matchIndex allows
+func (rf *Raft) updateCommitIndex() {
+	// see if leader can update its commitIndex to move forward
+	// we start from the end to see if we can move it all the way to the log length
+	for N := rf.getLastIndex(); N >= rf.commitIndex+1; N-- {
+		// if term does not match, we can't do anything
+		if rf.log[N].Term != rf.currentTerm {
+			continue
+		}
+
+		// same term -means-> same leader, means I (leader) am the one committing
+		count := 1
+		for server := range rf.peers {
+			if server != rf.me && rf.matchIndex[server] >= N {
+				count++
+			}
+		}
+
+		// the last majority supported N is taken as commitIndex
+		if count > len(rf.peers)/2 {
+			rf.commitIndex = N
+			// apply
+			go rf.apply()
+			break
+		}
+	}
+}
+
+// ============================== Persisters Logic ==============================
 
 // 2C
 // unlocked
