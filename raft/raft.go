@@ -205,7 +205,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	}
 
 	// 2A
-	if reply.Term > rf.currentTerm {
+	if reply.Term >= rf.currentTerm {
 		rf.debug("stale candidate (me)")
 		rf.toFollower(reply.Term)
 	}
@@ -310,48 +310,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// if the log is smaller or equal in size, we can just add/overwrite entries directly
-	if rf.getLastIndex() <= args.PrevLogIndex+len(args.Entries) {
-		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-	} else {
-		for i := 0; i < len(args.Entries); i++ {
-			log_i := args.PrevLogIndex + 1 + i
-
-			// exclude this term and beyond, since its incorrect
-			// and add this new entry
-			if args.Entries[i].Term != rf.log[log_i].Term {
-				rf.log = append(rf.log[:log_i], args.Entries[i:]...)
-				break
-			}
+	// leader sent right entries, they need to be written
+	for i := 0; i < len(args.Entries); i++ {
+		log_i := args.PrevLogIndex + 1 + i
+		// if no data present, add
+		if rf.getLastIndex() < log_i {
+			rf.log = append(rf.log, args.Entries[i])
+			continue
+		}
+		// exclude this term and beyond - this log is wrong
+		// and add this new entry
+		if args.Entries[i].Term != rf.log[log_i].Term {
+			rf.log = append(rf.log[:log_i], args.Entries[i])
+			continue
 		}
 	}
-
-	// old logic
-	// // leader sent right entries, they need to be written
-	// for i := 0; i < len(args.Entries); i++ {
-	// 	log_i := args.PrevLogIndex + 1 + i
-
-	// 	// if no data present, add
-	// 	if rf.getLastIndex() < log_i {
-	// 		rf.log = append(rf.log, args.Entries[i:]...)
-	// 		break
-	// 	}
-
-	// 	// exclude this term and beyond
-	// 	// and add this new entry
-	// 	if args.Entries[i].Term != rf.log[log_i].Term {
-	// 		rf.log = append(rf.log[:log_i], args.Entries[i:]...)
-	// 		break
-	// 	}
-	// }
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.debug("updating commitIndex")
 		rf.commitIndex = min(args.LeaderCommit, rf.getLastIndex())
-
-		// apply
-		go rf.apply()
 	}
+
+	// apply
+	go rf.apply()
 
 	// defaults
 	reply.Success = true
@@ -697,9 +678,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 // locked. moves lastApplied to commitIndex
+// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
 func (rf *Raft) apply() {
-	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// rf.debug(rf.commitIndex, rf.lastApplied)
